@@ -1,0 +1,29 @@
+# Virtual environments
+.venv/
+venv/
+
+# Environment files
+*.env
+!.env.example
+huggingface.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Frontend
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+tokenflow/
+tokenflow.zip
