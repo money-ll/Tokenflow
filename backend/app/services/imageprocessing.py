@@ -1171,6 +1171,53 @@ class ImageProcessor:
 
             return True
 
+        # ----------------------------------------------------
+        # Irregular internal capitalization
+        #
+        # Real printed/typed words don't switch from lowercase
+        # back to uppercase mid-word (e.g. "AagentinA", "Alscra",
+        # "Iune", "UNITeS"). This pattern is a strong signature
+        # of OCR misreading stylized text - curved jersey
+        # lettering, sponsor logos, small distant signage - and
+        # is common on photographs even when EasyOCR reports
+        # high per-character confidence.
+        # ----------------------------------------------------
+
+        words = text.split()
+
+        if words:
+
+            bad_words = 0
+
+            for word in words:
+
+                letters_only = "".join(
+                    ch
+                    for ch in word
+                    if ch.isalpha()
+                )
+
+                if len(letters_only) < 3:
+
+                    continue
+
+                # lowercase letter followed later by an
+                # uppercase letter, anywhere after position 0
+                if re.search(
+                    r"[a-z].*[A-Z]",
+                    letters_only[1:],
+                ):
+
+                    bad_words += 1
+
+            if (
+                bad_words
+                / len(words)
+                > 0.10
+            ):
+
+                return True
+
         return False
 
     # ========================================================
