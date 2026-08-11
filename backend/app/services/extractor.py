@@ -30,6 +30,14 @@ Image processing:
 The extractor preserves image descriptions as usable textual
 input so photographs can continue through TokenFlow's normal
 optimization pipeline.
+
+Math handling:
+
+    Any image or rendered/scanned PDF page is also passed through
+    MathExtractor. Detected formulas are converted to LaTeX and
+    appended as "Equation: <latex>" lines. TokenFlowPipeline pulls
+    these lines out before compression and reattaches them
+    unmodified afterward.
 """
 
 from __future__ import annotations
@@ -52,6 +60,10 @@ from app.services.printed_ocr import (
 
 from app.services.imageprocessing import (
     ImageProcessor,
+)
+
+from app.services.math_extractor import (
+    MathExtractor,
 )
 
 
@@ -85,7 +97,7 @@ class InputExtractor:
         """
         Create lightweight service objects.
 
-        Heavy OCR/captioning models remain lazy-loaded.
+        Heavy OCR/captioning/math models remain lazy-loaded.
         """
 
         # These objects should not load the actual models
@@ -115,6 +127,14 @@ class InputExtractor:
                     self._printed_ocr
                 ),
             )
+        )
+
+        # MathExtractor is cheap to construct: the region detector
+        # only imports cv2 when called, and the LatexOCR model is
+        # loaded lazily on the first .convert() call.
+
+        self._math_extractor = (
+            MathExtractor()
         )
 
     # ==========================================================
@@ -178,6 +198,44 @@ class InputExtractor:
         )
 
     # ==========================================================
+    # MATH DETECTION
+    # ==========================================================
+
+    def _detect_equations(
+        self,
+        image: Image.Image,
+    ) -> list[str]:
+        """
+        Run MathExtractor on a page/photo image and format any
+        detected formulas as 'Equation: <latex>' lines.
+
+        These lines are matched by
+        TokenFlowPipeline._extract_equations() and protected from
+        compression, then reattached unmodified after optimization.
+
+        Best-effort: any failure (missing opencv-python, missing
+        pix2tex, model load failure, etc.) returns an empty list
+        rather than breaking extraction.
+        """
+
+        try:
+
+            results = (
+                self._math_extractor.extract(
+                    image
+                )
+            )
+
+        except Exception:
+
+            return []
+
+        return [
+            f"Equation: {r.latex}"
+            for r in results
+        ]
+
+    # ==========================================================
     # IMAGE EXTRACTION
     # ==========================================================
 
@@ -206,6 +264,32 @@ class InputExtractor:
                 f"Could not process this image: "
                 f"{exc}"
             ) from exc
+
+        # ======================================================
+        # MATH DETECTION
+        #
+        # Runs independently of the OCR/BLIP outcome above, on the
+        # original uploaded image.
+        # ======================================================
+
+        try:
+
+            pil_image = (
+                Image.open(
+                    io.BytesIO(content)
+                )
+                .convert("RGB")
+            )
+
+            equation_lines = (
+                self._detect_equations(
+                    pil_image
+                )
+            )
+
+        except Exception:
+
+            equation_lines = []
 
         text = (
             self._clean_ocr_output(
@@ -265,6 +349,14 @@ class InputExtractor:
                 )
             )
 
+            if equation_lines:
+
+                combined_text = (
+                    combined_text.rstrip()
+                    + "\n\n"
+                    + "\n".join(equation_lines)
+                )
+
             return (
                 combined_text,
                 {
@@ -283,6 +375,12 @@ class InputExtractor:
                         or result.description
                     ),
                     "meta": meta,
+                    "math_extraction_used": bool(
+                        equation_lines
+                    ),
+                    "equations_found": len(
+                        equation_lines
+                    ),
                 },
             )
 
@@ -328,8 +426,18 @@ class InputExtractor:
             # This means the normal compression pipeline can
             # still process the image-derived information.
 
+            combined_description = description
+
+            if equation_lines:
+
+                combined_description = (
+                    combined_description.rstrip()
+                    + "\n\n"
+                    + "\n".join(equation_lines)
+                )
+
             return (
-                description,
+                combined_description,
                 {
                     "source_type": (
                         result.source_type
@@ -341,6 +449,12 @@ class InputExtractor:
                     "has_description": True,
                     "description": description,
                     "meta": meta,
+                    "math_extraction_used": bool(
+                        equation_lines
+                    ),
+                    "equations_found": len(
+                        equation_lines
+                    ),
                 },
             )
 
@@ -384,6 +498,7 @@ class InputExtractor:
         typed_pages = 0
         ocr_pages = 0
         blank_pages = 0
+        equations_found = 0
 
         total_pages = len(doc)
 
@@ -515,6 +630,31 @@ class InputExtractor:
                 )
 
                 # ==================================================
+                # MATH DETECTION
+                #
+                # Reuses the already-rendered page_image, so this
+                # adds no extra render cost.
+                # ==================================================
+
+                equation_lines = (
+                    self._detect_equations(
+                        page_image
+                    )
+                )
+
+                if equation_lines:
+
+                    ocr_text = (
+                        (ocr_text or "").rstrip()
+                        + "\n\n"
+                        + "\n".join(equation_lines)
+                    )
+
+                    equations_found += len(
+                        equation_lines
+                    )
+
+                # ==================================================
                 # PRESERVE PAGE
                 # ==================================================
 
@@ -564,6 +704,10 @@ class InputExtractor:
                 "typed_pages": typed_pages,
                 "ocr_pages": ocr_pages,
                 "blank_pages": blank_pages,
+                "math_extraction_used": (
+                    equations_found > 0
+                ),
+                "equations_found": equations_found,
             },
         )
 

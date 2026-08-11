@@ -228,7 +228,11 @@ class Pix2TexConverter:
         return self._model
 
     def convert(self, cropped_image: Image.Image) -> str:
-        model = self._load()
+        try:
+            model = self._load()
+        except Exception as exc:
+            logger.error("pix2tex model unavailable: %s", exc)
+            return ""
         try:
             return model(cropped_image)
         except Exception as exc:
