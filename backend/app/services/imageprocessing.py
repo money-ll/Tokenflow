@@ -247,18 +247,31 @@ class ImageProcessor:
                 confidence,
             ):
 
+                description = (
+                    self._safe_caption(
+                        image
+                    )
+                )
+
                 return ImageProcessResult(
                     text=text,
                     source_type="photo",
                     confidence=confidence,
                     has_text=True,
                     description=(
-                        "Readable text detected "
-                        "in a photograph."
+                        description
+                        or (
+                            "Readable text detected "
+                            "in a photograph."
+                        )
                     ),
                     meta={
                         "scores": scores,
-                        "recognizer": "EasyOCR",
+                        "recognizer": (
+                            "EasyOCR + BLIP"
+                            if description
+                            else "EasyOCR"
+                        ),
                     },
                 )
 
@@ -313,18 +326,38 @@ class ImageProcessor:
             confidence,
         ):
 
+            # OCR succeeded, but the image may still be a
+            # designed graphic (text overlaid on a photo)
+            # rather than a plain document. Also generate a
+            # visual description so both are available -
+            # this is best-effort: if captioning fails or
+            # is unavailable, we still return the OCR text.
+
+            description = (
+                self._safe_caption(
+                    image
+                )
+            )
+
             return ImageProcessResult(
                 text=text,
                 source_type=image_type,
                 confidence=confidence,
                 has_text=True,
                 description=(
-                    "Text extracted from "
-                    "the image."
+                    description
+                    or (
+                        "Text extracted from "
+                        "the image."
+                    )
                 ),
                 meta={
                     "scores": scores,
-                    "recognizer": "EasyOCR",
+                    "recognizer": (
+                        "EasyOCR + BLIP"
+                        if description
+                        else "EasyOCR"
+                    ),
                 },
             )
 
