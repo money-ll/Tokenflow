@@ -35,9 +35,20 @@ Math handling:
 
     Any image or rendered/scanned PDF page is also passed through
     MathExtractor. Detected formulas are converted to LaTeX and
-    appended as "Equation: <latex>" lines. TokenFlowPipeline pulls
-    these lines out before compression and reattaches them
-    unmodified afterward.
+    appended as "Equation: <latex>" lines, but only after passing
+    a validation filter (_looks_like_math) that rejects page
+    numbers, UI chrome, tiny hallucinated fragments, and other
+    pix2tex hallucinations on non-math crops. TokenFlowPipeline
+    pulls the surviving lines out before compression and restores
+    them in place afterward.
+
+OCR noise handling:
+
+    OCR-derived text (scanned PDF pages, image OCR) is passed
+    through _strip_ocr_noise to drop lines that are almost
+    certainly UI chrome (phone status bars, stray icon glyphs)
+    rather than genuine document content. Native typed PDF text
+    is never touched by this filter.
 """
 
 from __future__ import annotations
@@ -92,6 +103,34 @@ class InputExtractor:
     MIN_TYPED_CHARS_PER_PAGE = 20
 
     DEFAULT_OCR_RENDER_DPI = 150
+
+    # ==========================================================
+    # MATH VALIDATION CONSTANTS
+    # ==========================================================
+
+    _STRIP_CMD_RE = re.compile(r"\\[a-zA-Z]+")
+    _STRIP_BRACKETS_RE = re.compile(r"[{}\[\]()]")
+
+    _MATH_STRUCTURE_TOKENS = (
+        "\\frac", "\\sum", "\\int", "\\sqrt", "\\prod", "\\lim",
+        "^", "_", "=",
+        "\\alpha", "\\beta", "\\gamma", "\\theta", "\\pi", "\\sigma", "\\mu",
+    )
+
+    # Absolute pixel-size floor for a math crop. A genuine formula
+    # with structure (fraction bar, summation, etc.) needs enough
+    # room to actually render that structure -- tiny crops (badges,
+    # score digits, icons) that still produce syntactically-plausible
+    # LaTeX are almost always hallucinations, not real formulas.
+    _MIN_EQUATION_WIDTH = 50
+    _MIN_EQUATION_HEIGHT = 30
+
+    # ==========================================================
+    # OCR NOISE FILTER CONSTANTS
+    # ==========================================================
+
+    # Matches phone status-bar time readouts like "01.23", "01*24".
+    _STATUS_BAR_RE = re.compile(r"^\d{1,2}[.:*]\d{2}\b")
 
     def __init__(self) -> None:
         """
@@ -209,9 +248,16 @@ class InputExtractor:
         Run MathExtractor on a page/photo image and format any
         detected formulas as 'Equation: <latex>' lines.
 
+        Each detection is validated with _looks_like_math() before
+        being trusted -- the region detector is a generic dense-glyph
+        heuristic (not a math classifier), so it fires on UI chrome,
+        page numbers, and icons too, and pix2tex will happily
+        "convert" whatever crop it's handed. Anything that fails
+        validation is dropped rather than emitted as a fake equation.
+
         These lines are matched by
-        TokenFlowPipeline._extract_equations() and protected from
-        compression, then reattached unmodified after optimization.
+        TokenFlowPipeline._inline_equations() and protected from
+        compression, then restored in place afterward.
 
         Best-effort: any failure (missing opencv-python, missing
         pix2tex, model load failure, etc.) returns an empty list
@@ -226,14 +272,307 @@ class InputExtractor:
                 )
             )
 
-        except Exception:
+        except Exception as exc:
+
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Math extraction failed, skipping: %s", exc
+            )
 
             return []
 
-        return [
-            f"Equation: {r.latex}"
-            for r in results
+        equations = []
+
+        for r in results:
+
+            latex = r.latex.strip()
+
+            if self._looks_like_math(
+                latex,
+                r.bbox,
+                image.size,
+            ):
+
+                equations.append(
+                    f"Equation: {latex}"
+                )
+
+        return equations
+
+    # ==========================================================
+    # MATH VALIDATION
+    # ==========================================================
+
+    @classmethod
+    def _looks_like_math(
+        cls,
+        latex: str,
+        bbox,
+        image_size,
+    ) -> bool:
+        """
+        Reject pix2tex outputs that are almost certainly not real
+        math: bare page numbers, formatting-only commands with no
+        math structure, unbalanced/malformed LaTeX, autoregressive
+        repetition loops, crops too small to physically contain the
+        structure they claim to show, and crops spanning nearly the
+        whole image.
+        """
+
+        if not latex:
+
+            return False
+
+        x0, y0, x1, y1 = bbox
+        width = x1 - x0
+        height = y1 - y0
+
+        # ------------------------------------------------------
+        # Absolute size floor. A genuine formula with structure
+        # (fraction bar, summation, etc.) needs enough physical
+        # room to render that structure -- tiny crops producing
+        # "\frac{...}" or similar are almost always hallucinations
+        # on UI fragments (badges, score digits, icons).
+        # ------------------------------------------------------
+
+        if (
+            width < cls._MIN_EQUATION_WIDTH
+            or height < cls._MIN_EQUATION_HEIGHT
+        ):
+
+            return False
+
+        # ------------------------------------------------------
+        # Bare numerals, even wrapped in formatting commands like
+        # \mathsf{53} -- strip commands/brackets and check if only
+        # digits remain. Catches page numbers.
+        # ------------------------------------------------------
+
+        core = cls._STRIP_BRACKETS_RE.sub(
+            "",
+            cls._STRIP_CMD_RE.sub(
+                "",
+                latex,
+            ),
+        ).strip()
+
+        if re.fullmatch(r"\d+", core):
+
+            return False
+
+        # ------------------------------------------------------
+        # Must contain at least one token that actually signals
+        # math structure -- plain formatting commands (\mathsf,
+        # \textstyle, \scriptstyle) don't count on their own.
+        # ------------------------------------------------------
+
+        if not any(
+            tok in latex
+            for tok in cls._MATH_STRUCTURE_TOKENS
+        ):
+
+            return False
+
+        # ------------------------------------------------------
+        # Malformed/unbalanced LaTeX is a strong hallucination
+        # signal -- real pix2tex output on genuine formulas is
+        # well-formed.
+        # ------------------------------------------------------
+
+        if not cls._brackets_balanced(latex):
+
+            return False
+
+        # ------------------------------------------------------
+        # Autoregressive loop artifacts (repeated identical
+        # chunks) -- e.g. "\frac{-}{\varepsilon}" repeated 4x,
+        # "sin(sin(sin(...".
+        # ------------------------------------------------------
+
+        if cls._has_excessive_repetition(latex):
+
+            return False
+
+        # ------------------------------------------------------
+        # Sanity check output length against crop size: a small
+        # crop producing an implausibly long LaTeX string is
+        # hallucination, not a real formula.
+        # ------------------------------------------------------
+
+        crop_area = max(1, width * height)
+        img_area = image_size[0] * image_size[1]
+
+        if (
+            len(latex) > 400
+            and crop_area < 0.15 * img_area
+        ):
+
+            return False
+
+        # ------------------------------------------------------
+        # Reject crops covering almost the entire image -- a
+        # genuine isolated formula doesn't span nearly the whole
+        # page/screenshot. Catches UI screenshots being read
+        # whole as "one big equation".
+        # ------------------------------------------------------
+
+        if crop_area > 0.85 * img_area:
+
+            return False
+
+        return True
+
+    @staticmethod
+    def _brackets_balanced(latex: str) -> bool:
+
+        counts = {c: 0 for c in "{}()[]"}
+
+        for ch in latex:
+
+            if ch in counts:
+
+                counts[ch] += 1
+
+        return (
+            counts["{"] == counts["}"]
+            and counts["("] == counts[")"]
+            and counts["["] == counts["]"]
+        )
+
+    @staticmethod
+    def _has_excessive_repetition(
+        latex: str,
+        min_len: int = 8,
+        min_repeats: int = 3,
+    ) -> bool:
+
+        if len(latex) < min_len:
+
+            return False
+
+        max_chunk = min(
+            40,
+            len(latex) // min_repeats,
+        )
+
+        for size in range(
+            min_len,
+            max_chunk + 1,
+        ):
+
+            seen = {}
+
+            for i in range(
+                0,
+                len(latex) - size + 1,
+            ):
+
+                chunk = latex[i:i + size]
+
+                seen[chunk] = (
+                    seen.get(chunk, 0) + 1
+                )
+
+                if seen[chunk] >= min_repeats:
+
+                    return True
+
+        return False
+
+    # ==========================================================
+    # OCR NOISE FILTER
+    # ==========================================================
+
+    def _is_garbage_ocr_line(
+        self,
+        line: str,
+    ) -> bool:
+        """
+        Flags OCR lines that are almost certainly UI noise (phone
+        status bars, stray icon glyphs, battery/signal indicators)
+        rather than genuine document content -- short lines
+        dominated by symbols and single/double-character fragments
+        instead of real words.
+        """
+
+        stripped = line.strip()
+
+        if not stripped:
+
+            return False
+
+        tokens = stripped.split()
+
+        if not tokens:
+
+            return False
+
+        total_chars = len(stripped)
+
+        alnum_ratio = (
+            sum(
+                1
+                for c in stripped
+                if c.isalnum()
+            )
+            / total_chars
+        )
+
+        real_word_tokens = sum(
+            1
+            for t in tokens
+            if re.fullmatch(
+                r"[A-Za-z]{3,}",
+                t.strip(".,;:!?'\""),
+            )
+        )
+
+        real_word_ratio = (
+            real_word_tokens
+            / len(tokens)
+        )
+
+        if self._STATUS_BAR_RE.match(
+            stripped
+        ):
+
+            return True
+
+        if (
+            len(stripped) <= 40
+            and real_word_ratio < 0.35
+            and alnum_ratio < 0.6
+        ):
+
+            return True
+
+        return False
+
+    def _strip_ocr_noise(
+        self,
+        text: str,
+    ) -> str:
+        """
+        Drops OCR lines that are almost certainly noise, not
+        content. Applied ONLY to OCR-derived text (scanned PDF
+        pages, image OCR) -- never to native typed PDF text, which
+        pymupdf extracts reliably and needs no filtering. This
+        doesn't remove any real meaning: there was no meaning in a
+        misread status bar to begin with.
+        """
+
+        if not text:
+
+            return text
+
+        kept = [
+            line
+            for line in text.split("\n")
+            if not self._is_garbage_ocr_line(line)
         ]
+
+        return "\n".join(kept)
 
     # ==========================================================
     # IMAGE EXTRACTION
@@ -294,6 +633,12 @@ class InputExtractor:
         text = (
             self._clean_ocr_output(
                 result.text
+            )
+        )
+
+        text = (
+            self._strip_ocr_noise(
+                text
             )
         )
 
@@ -625,6 +970,12 @@ class InputExtractor:
 
                 ocr_text = (
                     self._clean_ocr_output(
+                        ocr_text
+                    )
+                )
+
+                ocr_text = (
+                    self._strip_ocr_noise(
                         ocr_text
                     )
                 )
