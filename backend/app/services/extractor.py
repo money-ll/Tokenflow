@@ -42,6 +42,19 @@ Math handling:
     pulls the surviving lines out before compression and restores
     them in place afterward.
 
+Diagram handling:
+
+    Images, scanned/rendered PDF pages, AND embedded raster images
+    on typed PDF pages (e.g. a flowchart figure sitting inside an
+    otherwise-typed page) are passed through DiagramExtractor. This
+    is a heuristic CV pipeline (box detection + connector-line
+    detection), not a trained diagram-understanding model -- see
+    diagram_extractor.py's module docstring for stated limitations.
+    Detected diagrams are rendered as Mermaid syntax and wrapped in
+    "[DIAGRAM_START] ... [DIAGRAM_END]" markers. TokenFlowPipeline
+    protects the whole block from compression and restores it
+    verbatim afterward, same mechanism as equations.
+
 OCR noise handling:
 
     OCR-derived text (scanned PDF pages, image OCR) is passed
@@ -75,6 +88,11 @@ from app.services.imageprocessing import (
 
 from app.services.math_extractor import (
     MathExtractor,
+)
+
+from app.services.diagram_extractor import (
+    DiagramExtractor,
+    MermaidRenderer,
 )
 
 
@@ -126,6 +144,39 @@ class InputExtractor:
     _MIN_EQUATION_HEIGHT = 30
 
     # ==========================================================
+    # DIAGRAM VALIDATION CONSTANTS
+    # ==========================================================
+
+    # A detection with more "nodes" than this is almost always a
+    # table, a dense UI screenshot, or grid noise -- not a genuine
+    # flowchart/block diagram (which in report figures rarely exceeds
+    # a dozen or so boxes).
+    _MAX_DIAGRAM_NODES = 20
+
+    # A real flowchart has visible whitespace/gaps between boxes. A
+    # dense table or grid of UI elements fills most of its frame with
+    # "node"-like rectangles. Rejecting high area coverage filters
+    # those out without needing to distinguish table cells from
+    # flowchart boxes directly.
+    _MAX_DIAGRAM_TOTAL_NODE_AREA_RATIO = 0.75
+
+    # Embedded PDF images smaller than this (in either dimension) are
+    # skipped for diagram detection -- logos, icons, and bullet
+    # graphics are common in typed pages and not worth the pipeline
+    # cost, and are a frequent source of false positives.
+    _MIN_EMBEDDED_IMAGE_DIMENSION = 150
+
+    # Typed-PDF layout detection. Vector diagrams are often drawn directly
+    # into the PDF (no embedded raster image exists), so get_images() alone
+    # cannot find them. These cheap thresholds let us inspect PyMuPDF
+    # drawing objects first and render only plausible figure regions.
+    _MIN_VECTOR_DIAGRAM_BOXES = 2
+    _MIN_VECTOR_DIAGRAM_LINES = 1
+    _MIN_VECTOR_DIAGRAM_AREA = 0.015
+    _MAX_VECTOR_DIAGRAM_AREA = 0.80
+    _VECTOR_RENDER_DPI = 160
+
+    # ==========================================================
     # OCR NOISE FILTER CONSTANTS
     # ==========================================================
 
@@ -136,7 +187,7 @@ class InputExtractor:
         """
         Create lightweight service objects.
 
-        Heavy OCR/captioning/math models remain lazy-loaded.
+        Heavy OCR/captioning/math/diagram models remain lazy-loaded.
         """
 
         # These objects should not load the actual models
@@ -174,6 +225,25 @@ class InputExtractor:
 
         self._math_extractor = (
             MathExtractor()
+        )
+
+        # DiagramExtractor is likewise cheap to construct: its
+        # detectors only import cv2 when called. Its label OCR is
+        # injected as a callable wrapping the SAME PrintedTextRecognizer
+        # instance used for page OCR, so there is no second EasyOCR
+        # model loaded -- diagram label reads just become additional
+        # calls against the one shared reader.
+
+        self._diagram_extractor = (
+            DiagramExtractor(
+                label_recognizer=(
+                    lambda crop: self._printed_ocr.recognize(crop)
+                ),
+            )
+        )
+
+        self._mermaid_renderer = (
+            MermaidRenderer()
         )
 
     # ==========================================================
@@ -256,8 +326,8 @@ class InputExtractor:
         validation is dropped rather than emitted as a fake equation.
 
         These lines are matched by
-        TokenFlowPipeline._inline_equations() and protected from
-        compression, then restored in place afterward.
+        TokenFlowPipeline._inline_protected_blocks() and protected
+        from compression, then restored in place afterward.
 
         Best-effort: any failure (missing opencv-python, missing
         pix2tex, model load failure, etc.) returns an empty list
@@ -481,6 +551,410 @@ class InputExtractor:
         return False
 
     # ==========================================================
+    # DIAGRAM DETECTION
+    # ==========================================================
+
+    def _detect_diagram(
+        self,
+        image: Image.Image,
+        label_provider=None,
+    ) -> str | None:
+        """
+        Run DiagramExtractor on an image and, if the detected
+        structure passes validation, return a fenced diagram block
+        ready to be spliced into extracted text:
+
+            [DIAGRAM_START]
+```mermaid
+            graph TD
+                N0["..."]
+                N1["..."]
+                N0 --> N1
+```
+            [DIAGRAM_END]
+
+        Returns None if no diagram-like structure was found, or if
+        what was found fails _looks_like_diagram() validation (too
+        many nodes, nodes covering too much of the frame -- signals
+        a table or dense UI screenshot rather than a flowchart, not
+        a genuine detection failure).
+
+        Best-effort: any failure (missing opencv-python, OCR failure,
+        etc.) returns None rather than breaking extraction.
+        """
+
+        try:
+
+            graph = (
+                self._diagram_extractor.extract(
+                    image,
+                    label_provider=label_provider,
+                )
+            )
+
+        except Exception as exc:
+
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Diagram extraction failed, skipping: %s", exc
+            )
+
+            return None
+
+        if graph is None:
+
+            return None
+
+        if not self._looks_like_diagram(
+            graph,
+            image.size,
+        ):
+
+            return None
+
+        mermaid = (
+            self._mermaid_renderer.render(
+                graph
+            )
+        )
+
+        return (
+            "[DIAGRAM_START]\n"
+            f"```mermaid\n{mermaid}\n```\n"
+            "[DIAGRAM_END]"
+        )
+
+    @classmethod
+    def _looks_like_diagram(
+        cls,
+        graph,
+        image_size,
+    ) -> bool:
+        """
+        Rejects detections that are structurally implausible as a
+        genuine flowchart/block diagram: too many boxes (usually a
+        table or dense grid of UI elements, not a diagram), or node
+        area covering most of the frame (a table fills most of its
+        image; a real flowchart has visible whitespace between boxes).
+        """
+
+        node_count = len(graph.nodes)
+
+        if (
+            node_count < 2
+            or node_count > cls._MAX_DIAGRAM_NODES
+        ):
+
+            return False
+
+        img_area = max(
+            1,
+            image_size[0] * image_size[1],
+        )
+
+        total_node_area = sum(
+            (x1 - x0) * (y1 - y0)
+            for (x0, y0, x1, y1) in (
+                n.bbox for n in graph.nodes
+            )
+        )
+
+        if (
+            total_node_area / img_area
+            > cls._MAX_DIAGRAM_TOTAL_NODE_AREA_RATIO
+        ):
+
+            return False
+
+        return True
+
+    def _extract_page_equations(self, page) -> list[str]:
+        """Extract equations from a typed PDF without OCR'ing the page.
+
+        PyMuPDF already exposes text-line bounding boxes.  We use those
+        boxes as a cheap candidate detector and render only the few lines
+        that contain real mathematical signals.  The cropped line is then
+        sent to pix2tex as one complete expression, preserving fractions,
+        superscripts and grouped symbols.
+        """
+        try:
+            data = page.get_text("dict")
+        except Exception:
+            return []
+
+        lines = []
+        for block in data.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                text = "".join(span.get("text", "") for span in spans).strip()
+                bbox = line.get("bbox")
+                if text and bbox and self._is_math_candidate_text(text):
+                    lines.append((bbox, text))
+
+        if not lines:
+            return []
+
+        # Merge vertically adjacent candidate lines.  This handles equations
+        # whose numerator/denominator or aligned parts are represented as
+        # separate PDF text lines.
+        groups = []
+        for bbox, text in sorted(lines, key=lambda x: (x[0][1], x[0][0])):
+            if not groups:
+                groups.append([bbox, text])
+                continue
+            prev = groups[-1][0]
+            gap = bbox[1] - prev[3]
+            overlap = max(0.0, min(prev[2], bbox[2]) - max(prev[0], bbox[0]))
+            min_width = max(1.0, min(prev[2] - prev[0], bbox[2] - bbox[0]))
+            if gap <= 8 and overlap / min_width >= 0.20:
+                groups[-1][0] = (
+                    min(prev[0], bbox[0]), min(prev[1], bbox[1]),
+                    max(prev[2], bbox[2]), max(prev[3], bbox[3])
+                )
+                groups[-1][1] += " " + text
+            else:
+                groups.append([bbox, text])
+
+        results = []
+        seen = set()
+        for bbox, _native_text in groups[:12]:
+            # Expand enough to include fraction bars and superscripts, but
+            # keep the crop local so pix2tex never sees an entire page.
+            rect = pymupdf.Rect(bbox)
+            rect.x0 -= 8
+            rect.y0 -= 8
+            rect.x1 += 8
+            rect.y1 += 8
+            rect &= page.rect
+            if rect.width < 45 or rect.height < 18:
+                continue
+            try:
+                pix = page.get_pixmap(dpi=self._VECTOR_RENDER_DPI, clip=rect, alpha=False)
+                image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                extracted = self._detect_equations(image)
+            except Exception:
+                continue
+            for equation in extracted:
+                key = equation.strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    results.append(equation)
+        return results
+
+    @staticmethod
+    def _looks_like_math_text(text: str) -> bool:
+        """Backward-compatible text-only math candidate heuristic."""
+        if not text:
+            return False
+        t = text.strip()
+        if re.search(r"\b(?:E\s*=|[A-Za-z]\s*\^\s*\d|\\(?:frac|sum|int|sqrt))", t):
+            return True
+        if re.search(r"[∑∫√≤≥≠±×÷∞]", t):
+            return bool(re.search(r"\d|[A-Za-z]", t))
+        if "=" in t and re.search(r"[A-Za-z]", t) and re.search(r"\d|[\^_]", t):
+            return True
+        return False
+
+    @staticmethod
+    def _is_math_candidate_text(text: str) -> bool:
+        """Cheap high-recall equation candidate test; no model invocation."""
+        t = text.strip()
+        if len(t) < 3 or len(t) > 350:
+            return False
+        # Strong mathematical operators/symbols.
+        strong = sum(ch in "=^_∑∫√≈≤≥≠±×÷∞⋅·|" for ch in t)
+        has_digit = bool(re.search(r"\d", t))
+        has_math_word = bool(re.search(
+            r"\b(cosine|similarity|softmax|logit|probability|formula|equation|average|sum|score)\b",
+            t,
+            re.IGNORECASE,
+        ))
+        # '=' plus a numeric/symbolic expression is the strongest signal.
+        if "=" in t and (has_digit or strong >= 2):
+            return True
+        if strong >= 3 and has_digit:
+            return True
+        if re.search(r"[≤≥≈≠±×÷∞→]", t) and has_digit:
+            return True
+        # A math-labelled line may have symbols encoded poorly in the PDF.
+        if has_math_word and strong >= 1:
+            return True
+        return False
+
+    @classmethod
+    def _remove_math_candidate_lines(cls, text: str) -> str:
+        if not text:
+            return text
+        kept = [
+            line for line in text.splitlines()
+            if not cls._is_math_candidate_text(line)
+        ]
+        return "\n".join(kept).strip()
+
+    def _extract_vector_diagram_regions(self, page):
+        """Return plausible vector-drawing figure clips on a typed page."""
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            return []
+        if not drawings:
+            return []
+
+        page_area = max(1.0, page.rect.width * page.rect.height)
+        rects = []
+        lines = []
+        for d in drawings:
+            r = d.get("rect")
+            if not r:
+                continue
+            items = d.get("items", [])
+            has_rect = any(item and item[0] == "re" for item in items)
+            has_line = any(item and item[0] == "l" for item in items)
+            area = max(0.0, r.width * r.height)
+            if has_rect and area > 25:
+                rects.append(r)
+            if has_line:
+                lines.append(r)
+
+        if len(rects) < self._MIN_VECTOR_DIAGRAM_BOXES or len(lines) < self._MIN_VECTOR_DIAGRAM_LINES:
+            return []
+
+        # Cluster drawing objects that are spatially close.  A report page
+        # can contain more than one figure, so don't render the entire page.
+        clusters = []
+        for r in sorted(rects + lines, key=lambda x: (x.y0, x.x0)):
+            placed = False
+            for i, c in enumerate(clusters):
+                expanded = pymupdf.Rect(c)
+                expanded.x0 -= 36; expanded.y0 -= 36
+                expanded.x1 += 36; expanded.y1 += 36
+                if expanded.intersects(r):
+                    clusters[i] = pymupdf.Rect(
+                        min(c.x0, r.x0), min(c.y0, r.y0),
+                        max(c.x1, r.x1), max(c.y1, r.y1)
+                    )
+                    placed = True
+                    break
+            if not placed:
+                clusters.append(pymupdf.Rect(r))
+
+        # Merge overlapping/nearby clusters transitively.  A connector can
+        # touch two boxes and initially create two clusters; they must become
+        # one figure region before rendering, otherwise each crop contains
+        # only one node and diagram extraction correctly rejects it.
+        changed = True
+        while changed:
+            changed = False
+            merged = []
+            used = [False] * len(clusters)
+            for i, c in enumerate(clusters):
+                if used[i]:
+                    continue
+                current = pymupdf.Rect(c)
+                used[i] = True
+                for j in range(i + 1, len(clusters)):
+                    if used[j]:
+                        continue
+                    other = clusters[j]
+                    expanded = pymupdf.Rect(current)
+                    expanded.x0 -= 36; expanded.y0 -= 36
+                    expanded.x1 += 36; expanded.y1 += 36
+                    if expanded.intersects(other):
+                        current = pymupdf.Rect(
+                            min(current.x0, other.x0),
+                            min(current.y0, other.y0),
+                            max(current.x1, other.x1),
+                            max(current.y1, other.y1),
+                        )
+                        used[j] = True
+                        changed = True
+                merged.append(current)
+            clusters = merged
+
+        valid = []
+        for c in clusters:
+            area_ratio = (c.width * c.height) / page_area
+            if self._MIN_VECTOR_DIAGRAM_AREA <= area_ratio <= self._MAX_VECTOR_DIAGRAM_AREA:
+                c.x0 = max(page.rect.x0, c.x0 - 10)
+                c.y0 = max(page.rect.y0, c.y0 - 10)
+                c.x1 = min(page.rect.x1, c.x1 + 10)
+                c.y1 = min(page.rect.y1, c.y1 + 10)
+                valid.append(c)
+        return valid[:6]
+
+    def _extract_page_diagrams(self, doc, page) -> list[str]:
+        """Extract both embedded-raster and vector diagrams from typed PDFs."""
+        blocks: list[str] = []
+
+        # 1) Embedded raster figures.
+        try:
+            image_refs = page.get_images(full=True)
+        except Exception:
+            image_refs = []
+        for img_info in image_refs:
+            xref = img_info[0]
+            try:
+                extracted = doc.extract_image(xref)
+                embedded = Image.open(io.BytesIO(extracted["image"])).convert("RGB")
+            except Exception:
+                continue
+            if min(embedded.width, embedded.height) < self._MIN_EMBEDDED_IMAGE_DIMENSION:
+                continue
+            block = self._detect_diagram(embedded)
+            if block and block not in blocks:
+                blocks.append(block)
+
+        # 2) Vector figures: flowcharts/architectures drawn directly in the
+        # PDF have no image xref.  Render only the drawing cluster, not the
+        # whole page, and feed that crop through the same detector.
+        for clip in self._extract_vector_diagram_regions(page):
+            try:
+                pix = page.get_pixmap(dpi=self._VECTOR_RENDER_DPI, clip=clip, alpha=False)
+                image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            except Exception:
+                continue
+
+            # Vector diagrams usually contain real PDF text labels. Reuse
+            # that text layer instead of invoking EasyOCR once per node.
+            # This is both faster and more accurate than OCR for diagrams
+            # such as System Architecture, DFD, ER and class diagrams.
+            try:
+                words = page.get_text("words") or []
+            except Exception:
+                words = []
+
+            scale = self._VECTOR_RENDER_DPI / 72.0
+
+            def native_label_provider(pixel_bbox, _clip=clip, _words=words, _scale=scale):
+                px0, py0, px1, py1 = pixel_bbox
+                page_box = pymupdf.Rect(
+                    _clip.x0 + px0 / _scale,
+                    _clip.y0 + py0 / _scale,
+                    _clip.x0 + px1 / _scale,
+                    _clip.y0 + py1 / _scale,
+                )
+                parts = []
+                for word in _words:
+                    if len(word) < 5:
+                        continue
+                    wx0, wy0, wx1, wy1, word_text = word[:5]
+                    cx = (wx0 + wx1) / 2
+                    cy = (wy0 + wy1) / 2
+                    if page_box.contains(pymupdf.Point(cx, cy)):
+                        parts.append((wy0, wx0, str(word_text)))
+                parts.sort(key=lambda item: (item[0], item[1]))
+                return " ".join(item[2] for item in parts)
+
+            block = self._detect_diagram(image, label_provider=native_label_provider)
+            if block and block not in blocks:
+                blocks.append(block)
+
+        return blocks
+
+    # ==========================================================
     # OCR NOISE FILTER
     # ==========================================================
 
@@ -605,11 +1079,14 @@ class InputExtractor:
             ) from exc
 
         # ======================================================
-        # MATH DETECTION
+        # MATH + DIAGRAM DETECTION
         #
         # Runs independently of the OCR/BLIP outcome above, on the
         # original uploaded image.
         # ======================================================
+
+        equation_lines: list[str] = []
+        diagram_block: str | None = None
 
         try:
 
@@ -626,9 +1103,16 @@ class InputExtractor:
                 )
             )
 
+            diagram_block = (
+                self._detect_diagram(
+                    pil_image
+                )
+            )
+
         except Exception:
 
             equation_lines = []
+            diagram_block = None
 
         text = (
             self._clean_ocr_output(
@@ -648,6 +1132,14 @@ class InputExtractor:
                 or ""
             )
         )
+
+        extra_blocks = list(equation_lines)
+
+        if diagram_block:
+
+            extra_blocks.append(
+                diagram_block
+            )
 
         # ======================================================
         # CASE 1:
@@ -694,12 +1186,12 @@ class InputExtractor:
                 )
             )
 
-            if equation_lines:
+            if extra_blocks:
 
                 combined_text = (
                     combined_text.rstrip()
                     + "\n\n"
-                    + "\n".join(equation_lines)
+                    + "\n\n".join(extra_blocks)
                 )
 
             return (
@@ -725,6 +1217,12 @@ class InputExtractor:
                     ),
                     "equations_found": len(
                         equation_lines
+                    ),
+                    "diagram_extraction_used": bool(
+                        diagram_block
+                    ),
+                    "diagrams_found": (
+                        1 if diagram_block else 0
                     ),
                 },
             )
@@ -773,12 +1271,12 @@ class InputExtractor:
 
             combined_description = description
 
-            if equation_lines:
+            if extra_blocks:
 
                 combined_description = (
                     combined_description.rstrip()
                     + "\n\n"
-                    + "\n".join(equation_lines)
+                    + "\n\n".join(extra_blocks)
                 )
 
             return (
@@ -800,6 +1298,12 @@ class InputExtractor:
                     "equations_found": len(
                         equation_lines
                     ),
+                    "diagram_extraction_used": bool(
+                        diagram_block
+                    ),
+                    "diagrams_found": (
+                        1 if diagram_block else 0
+                    ),
                 },
             )
 
@@ -815,6 +1319,28 @@ class InputExtractor:
                 "description could be extracted."
             )
         )
+
+    @staticmethod
+    def _contains_math_signal(text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(
+            r"(?:=|\^|_|∑|∫|√|≈|≤|≥|≠|±|×|÷|∞|\\frac|\\sum|\\int|\\sqrt|"
+            r"\b(?:cosine|similarity|softmax|logits?|probabilit(?:y|ies)|formula|equation)\b)",
+            text,
+            re.IGNORECASE,
+        ))
+
+    @staticmethod
+    def _contains_diagram_signal(text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(
+            r"\b(?:figure|diagram|architecture|flowchart|DFD|ER\s*-?\s*diagram|"
+            r"class\s+diagram|use\s+case|system\s+architecture)\b",
+            text,
+            re.IGNORECASE,
+        ))
 
     # ==========================================================
     # PDF EXTRACTION
@@ -844,6 +1370,7 @@ class InputExtractor:
         ocr_pages = 0
         blank_pages = 0
         equations_found = 0
+        diagrams_found = 0
 
         total_pages = len(doc)
 
@@ -880,13 +1407,42 @@ class InputExtractor:
                     >= self.MIN_TYPED_CHARS_PER_PAGE
                 ):
 
-                    pages.append(
+                    page_text = (
                         f"[Page {page_number}]\n"
                         f"{cleaned_text}"
                     )
 
-                    typed_pages += 1
+                    # Typed pages normally use the fast native PDF text
+                    # path.  We do NOT OCR the whole page.  Instead, run
+                    # targeted math extraction only when the native text
+                    # contains a likely equation line, and targeted
+                    # diagram extraction only when PyMuPDF reports vector
+                    # drawing structure.  This fixes the two common cases
+                    # that were previously skipped entirely.
+                    page_equations = self._extract_page_equations(page)
+                    if page_equations:
+                        # Remove the raw/mangled native equation lines so the
+                        # LaTeX representation is not duplicated in output.
+                        cleaned_without_math = self._remove_math_candidate_lines(cleaned_text)
+                        page_text = (
+                            f"[Page {page_number}]\n"
+                            f"{cleaned_without_math}"
+                            + "\n\n"
+                            + "\n".join(page_equations)
+                        )
+                        equations_found += len(page_equations)
 
+                    page_diagrams = self._extract_page_diagrams(doc, page)
+                    if page_diagrams:
+                        page_text = (
+                            page_text.rstrip()
+                            + "\n\n"
+                            + "\n\n".join(page_diagrams)
+                        )
+                        diagrams_found += len(page_diagrams)
+
+                    pages.append(page_text)
+                    typed_pages += 1
                     continue
 
                 # ==================================================
@@ -987,11 +1543,9 @@ class InputExtractor:
                 # adds no extra render cost.
                 # ==================================================
 
-                equation_lines = (
-                    self._detect_equations(
-                        page_image
-                    )
-                )
+                equation_lines = []
+                if self._contains_math_signal(ocr_text):
+                    equation_lines = self._detect_equations(page_image)
 
                 if equation_lines:
 
@@ -1004,6 +1558,26 @@ class InputExtractor:
                     equations_found += len(
                         equation_lines
                     )
+
+                # ==================================================
+                # DIAGRAM DETECTION
+                #
+                # Also reuses the already-rendered page_image.
+                # ==================================================
+
+                diagram_block = None
+                if self._contains_diagram_signal(ocr_text):
+                    diagram_block = self._detect_diagram(page_image)
+
+                if diagram_block:
+
+                    ocr_text = (
+                        (ocr_text or "").rstrip()
+                        + "\n\n"
+                        + diagram_block
+                    )
+
+                    diagrams_found += 1
 
                 # ==================================================
                 # PRESERVE PAGE
@@ -1059,6 +1633,10 @@ class InputExtractor:
                     equations_found > 0
                 ),
                 "equations_found": equations_found,
+                "diagram_extraction_used": (
+                    diagrams_found > 0
+                ),
+                "diagrams_found": diagrams_found,
             },
         )
 

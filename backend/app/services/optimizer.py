@@ -88,10 +88,20 @@ class SemanticOptimizer:
 
     def safe_stopword_reduction(self, text):
         # No fragile character-range regex. Tokenize with simple, safe patterns.
-        tokens = re.findall(
-            r"https?://\S+|\d+(?:\.\d+)?%?|[A-Za-z]+(?:'[A-Za-z]+)?|[^\w\s]",
-            text,
+        # Preserve technical/document compounds as single tokens.  The old
+        # tokenizer split ``Node.js`` into ``Node . js`` and ``real-time``
+        # into ``real - time`` which made otherwise-correct PDF extraction
+        # look corrupted.  Keep dotted, hyphenated and slash-separated
+        # identifiers intact while still treating ordinary sentence periods
+        # as punctuation.
+        token_pattern = (
+            r"https?://\S+|"
+            r"[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)+(?:%|)?|"
+            r"\d+(?:\.\d+)?%?|"
+            r"[A-Za-z]+(?:'[A-Za-z]+)?|"
+            r"[^\w\s]"
         )
+        tokens = re.findall(token_pattern, text)
         out = []
         for token in tokens:
             low = token.lower()
@@ -224,3 +234,4 @@ class SemanticOptimizer:
     def restore_readability(self, text):
         text = re.sub(r"\s+([,.!?;:])", r"\1", text)
         return re.sub(r"\s{2,}", " ", text).strip()
+

@@ -8,16 +8,29 @@ from app.services.tokenizer import TokenCounter
 
 
 class TokenFlowPipeline:
-    # Pure letters-digits-letters, no symbols. optimizer.py's tokenizer
-    # (safe_stopword_reduction) always splits digits away from letter
-    # runs and rejoins everything with single spaces, so any placeholder
-    # containing punctuation/brackets gets corrupted. This format always
-    # splits into exactly 3 tokens in the same order — PREFIX, digits,
-    # SUFFIX — so the restore regex just tolerates the inserted spaces.
-    _PLACEHOLDER_PREFIX = "TFMATHEQSTART"
-    _PLACEHOLDER_SUFFIX = "TFMATHEQEND"
+    # Pure letters-digits-letters, no symbols -- optimizer.py's
+    # tokenizer (safe_stopword_reduction) always splits digits away
+    # from letter runs and rejoins everything with single spaces, so
+    # any placeholder containing punctuation/brackets gets corrupted.
+    # This format always splits into exactly 3 tokens in the same
+    # order -- PREFIX, digits, SUFFIX -- so the restore regex just
+    # tolerates the inserted spaces. Shared by BOTH equations and
+    # diagrams so both survive optimization the same way.
+    _PLACEHOLDER_PREFIX = "TFPROTECTEDSTART"
+    _PLACEHOLDER_SUFFIX = "TFPROTECTEDEND"
     _PLACEHOLDER_RE = re.compile(
         rf"{_PLACEHOLDER_PREFIX}\s*(\d+)\s*{_PLACEHOLDER_SUFFIX}"
+    )
+
+    # Matches a single "Equation: <latex>" line.
+    _EQUATION_LINE_RE = re.compile(r"^Equation:\s*(.+)$")
+
+    # Matches a full "[DIAGRAM_START] ... [DIAGRAM_END]" block,
+    # including the fenced ```mermaid ... ``` content inside it.
+    # DOTALL so '.' matches newlines -- diagram blocks are multi-line.
+    _DIAGRAM_BLOCK_RE = re.compile(
+        r"\[DIAGRAM_START\](.*?)\[DIAGRAM_END\]",
+        re.DOTALL,
     )
 
     def __init__(self):
@@ -30,11 +43,13 @@ class TokenFlowPipeline:
         raw_tokens = self.counter.count(raw_text)
 
         text_for_compression = raw_text
-        equations = []
+        protected_blocks = []
 
-        if source_meta.get("math_extraction_used"):
-            text_for_compression, equations = (
-                self._inline_equations(raw_text)
+        if source_meta.get("math_extraction_used") or source_meta.get(
+            "diagram_extraction_used"
+        ):
+            text_for_compression, protected_blocks = (
+                self._inline_protected_blocks(raw_text)
             )
 
         optimized = self.optimizer.optimize(
@@ -44,13 +59,15 @@ class TokenFlowPipeline:
 
         context = optimized["text"]
 
-        if equations:
-            context, missing = self._restore_equations(context, equations)
+        if protected_blocks:
+            context, missing = self._restore_protected_blocks(
+                context, protected_blocks
+            )
             if missing:
                 context = (
                     context.rstrip()
                     + "\n\n"
-                    + "\n".join(missing)
+                    + "\n\n".join(missing)
                 )
 
         if query.strip():
@@ -68,6 +85,14 @@ class TokenFlowPipeline:
             (filename + str(datetime.now(timezone.utc).timestamp())).encode()
         ).hexdigest()[:12]
 
+        # Diagram blocks always start with "```mermaid"; equation
+        # blocks always start with "$$". Cheap discriminator, no need
+        # to carry two separate lists through the restore machinery.
+        diagrams_count = sum(
+            1 for b in protected_blocks if b.startswith("```mermaid")
+        )
+        equations_count = len(protected_blocks) - diagrams_count
+
         return {
             "id": digest,
             "filename": filename,
@@ -81,7 +106,8 @@ class TokenFlowPipeline:
                 "original_sentence_count": optimized["original_sentence_count"],
                 "optimized_sentence_count": optimized["optimized_sentence_count"],
                 "duplicate_sentences_removed": optimized["duplicate_sentences_removed"],
-                "equations_preserved": len(equations),
+                "equations_preserved": equations_count,
+                "diagrams_preserved": diagrams_count,
                 "stage_tokens": {
                     name: self.counter.count(value)
                     for name, value in optimized["stages"].items()
@@ -96,48 +122,78 @@ class TokenFlowPipeline:
                 "handwriting_recognition": source_meta.get("source_type")
                 == "handwritten",
                 "ocr_fallback_used": source_meta.get("ocr_pages", 0) > 0,
-                "equation_preservation": bool(equations),
+                "equation_preservation": equations_count > 0,
+                "diagram_preservation": diagrams_count > 0,
             },
         }
 
     @classmethod
-    def _inline_equations(cls, text):
-        """
-        Replace each "Equation: <latex>" line with a placeholder token
-        IN PLACE, so optimization sees a marker at the equation's
-        original position. The raw LaTeX is reformatted as display
-        math ($$...$$) here.
-
-        Returns (text_with_placeholders, equations) where equations[i]
-        is the fully-formatted string that placeholder i stands in for.
-        """
+    def _extract_equations(cls, text):
+        """Compatibility helper used by tests and external callers."""
         equations = []
+        kept = []
+        for line in text.splitlines():
+            match = cls._EQUATION_LINE_RE.match(line.strip())
+            if match:
+                equations.append(f"Equation: {match.group(1).strip()}")
+            elif line.strip():
+                kept.append(line.strip())
+        return "\n".join(kept), equations
+
+    @classmethod
+    def _inline_protected_blocks(cls, text):
+        """
+        Replace every "Equation: <latex>" line AND every
+        "[DIAGRAM_START]...[DIAGRAM_END]" block with a single-line
+        placeholder token IN PLACE, so optimization sees a marker at
+        each block's original position instead of losing it, and so
+        the optimizer's line/sentence-based logic never sees (and
+        can't corrupt) raw LaTeX or Mermaid syntax.
+
+        Diagram blocks are extracted FIRST -- since they span multiple
+        lines, extracting them before the line-by-line equation pass
+        prevents any internal diagram line from being misread as an
+        "Equation:" line.
+
+        Returns (text_with_placeholders, blocks) where blocks[i] is
+        the exact, fully-formatted string placeholder i stands in for
+        -- "$$...$$" for equations, "```mermaid...```" for diagrams.
+        """
+        blocks = []
+
+        def _diagram_sub(match):
+            mermaid_content = match.group(1).strip()
+            formatted = f"```mermaid\n{mermaid_content}\n```"
+            idx = len(blocks)
+            blocks.append(formatted)
+            return f"{cls._PLACEHOLDER_PREFIX}{idx}{cls._PLACEHOLDER_SUFFIX}"
+
+        text = cls._DIAGRAM_BLOCK_RE.sub(_diagram_sub, text)
+
         out_lines = []
-
         for line in text.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("Equation:"):
-                latex = stripped[len("Equation:"):].strip()
+            m = cls._EQUATION_LINE_RE.match(line.strip())
+            if m:
+                latex = m.group(1).strip()
                 formatted = f"$${latex}$$"
-
-                idx = len(equations)
-                equations.append(formatted)
+                idx = len(blocks)
+                blocks.append(formatted)
                 out_lines.append(
                     f"{cls._PLACEHOLDER_PREFIX}{idx}{cls._PLACEHOLDER_SUFFIX}"
                 )
             else:
                 out_lines.append(line)
 
-        return "\n".join(out_lines), equations
+        return "\n".join(out_lines), blocks
 
     @classmethod
-    def _restore_equations(cls, text, equations):
+    def _restore_protected_blocks(cls, text, blocks):
         """
-        Swap placeholders back for their original (formatted) equation
+        Swap placeholders back for their original (formatted) block
         strings. Tolerates whitespace the optimizer's tokenizer may
         have inserted between the placeholder's letter/digit segments.
 
-        Returns (restored_text, missing) — equations whose placeholder
+        Returns (restored_text, missing) -- blocks whose placeholder
         wasn't found at all (the optimizer dropped that sentence
         entirely) get appended by the caller instead of silently lost.
         """
@@ -146,8 +202,8 @@ class TokenFlowPipeline:
         def _sub(match):
             idx = int(match.group(1))
             found.add(idx)
-            return equations[idx]
+            return blocks[idx]
 
         restored = cls._PLACEHOLDER_RE.sub(_sub, text)
-        missing = [eq for i, eq in enumerate(equations) if i not in found]
+        missing = [b for i, b in enumerate(blocks) if i not in found]
         return restored, missing
