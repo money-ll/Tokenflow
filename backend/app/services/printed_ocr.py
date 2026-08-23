@@ -77,6 +77,20 @@ class PrintedTextRecognizer:
     SLOW_THRESHOLD = 3.0
     VERY_SLOW_THRESHOLD = 5.0
 
+    # Recognition batch size.
+    #
+    # NOTE: this does NOT batch multiple pages together. It
+    # batches the individual text-region crops that EasyOCR's
+    # detector finds WITHIN a single image through the CRNN
+    # recognizer in one pass instead of one-crop-at-a-time.
+    # With batch_size=1 (the old default), a page/retry pass
+    # that turns up many candidate regions pays full Python +
+    # CUDA launch overhead per region, which is what made the
+    # full-resolution retry pass so slow. Batching this has no
+    # effect on what gets detected/recognized -- same results,
+    # far less overhead.
+    RECOGNITION_BATCH_SIZE = 8
+
     def __init__(self):
 
         self._reader = None
@@ -451,14 +465,11 @@ class PrintedTextRecognizer:
             time.perf_counter()
         )
 
-        # IMPORTANT:
-        #
-        # batch_size is intentionally NOT specified.
-        #
-        # We process one page at a time, so batch_size=2 does
-        # not provide meaningful batching benefits here.
-        #
-        # EasyOCR will use its normal optimized execution path.
+        # batch_size batches the recognizer step across all
+        # text-region crops the detector found in THIS image
+        # (see RECOGNITION_BATCH_SIZE docstring above). It does
+        # not change detection thresholds, so results are
+        # identical to the batch_size=1 path -- just faster.
 
         if fast_mode:
 
@@ -486,6 +497,9 @@ class PrintedTextRecognizer:
 
                     width_ths=0.7,
                     ycenter_ths=0.5,
+
+                    batch_size=self.RECOGNITION_BATCH_SIZE,
+                    workers=0,
                 )
             )
 
@@ -543,6 +557,9 @@ class PrintedTextRecognizer:
                     ycenter_ths=(
                         self.YCENTER_THRESHOLD
                     ),
+
+                    batch_size=self.RECOGNITION_BATCH_SIZE,
+                    workers=0,
                 )
             )
 
@@ -594,7 +611,11 @@ class PrintedTextRecognizer:
         # resizing, without paying the cost on every normal page.
         # ----------------------------------------------------
 
+        retry_time = 0.0
+
         if not lines and resized:
+
+            retry_start = time.perf_counter()
 
             print(
                 "[OCR] 0 blocks detected on resized "
@@ -619,6 +640,13 @@ class PrintedTextRecognizer:
                 adjust_contrast=self.ADJUST_CONTRAST,
                 width_ths=self.WIDTH_THRESHOLD,
                 ycenter_ths=self.YCENTER_THRESHOLD,
+                # This retry runs at near-full resolution, so the
+                # detector proposes far more candidate regions than
+                # the normal downscaled pass. Without batching, each
+                # one pays full recognizer overhead sequentially --
+                # this is what caused the 15-20s spikes.
+                batch_size=self.RECOGNITION_BATCH_SIZE,
+                workers=0,
             )
 
             for result in retry_results:
@@ -636,9 +664,12 @@ class PrintedTextRecognizer:
                 if cleaned:
                     lines.append(cleaned)
 
+            retry_time = time.perf_counter() - retry_start
+
             print(
                 f"[OCR] Full-resolution retry: "
-                f"{len(lines)} block(s) recovered"
+                f"{len(lines)} block(s) recovered "
+                f"({retry_time:.3f}s)"
             )
 
         text = "\n".join(
@@ -666,8 +697,14 @@ class PrintedTextRecognizer:
 
         print(
             f"[OCR] Post-processing: "
-            f"{post_time:.3f}s"
+            f"{(post_time - retry_time):.3f}s"
         )
+
+        if retry_time:
+            print(
+                f"[OCR] Full-resolution retry OCR: "
+                f"{retry_time:.3f}s"
+            )
 
         print(
             f"[OCR] Total page OCR: "

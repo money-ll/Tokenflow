@@ -120,7 +120,13 @@ class InputExtractor:
 
     MIN_TYPED_CHARS_PER_PAGE = 20
 
-    DEFAULT_OCR_RENDER_DPI = 150
+    # 150 DPI on a Letter-size page renders ~1275x1650 -- more
+    # pixels than EasyOCR needs for normal body text, and EasyOCR's
+    # cost scales roughly with pixel count. 120 DPI (~1020x1320)
+    # cuts the OCR canvas by ~36% while staying well above the
+    # resolution needed to read ordinary printed text; drop lower
+    # only if you start seeing missed characters on small fonts.
+    DEFAULT_OCR_RENDER_DPI = 120
 
     # ==========================================================
     # MATH VALIDATION CONSTANTS

@@ -1,4 +1,5 @@
 """
+backend/app/services/imageprocessing.py
 TokenFlow Multimodal Image Processor
 
 Routes PNG/JPG/JPEG images to the appropriate processing path.

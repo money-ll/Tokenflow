@@ -1,4 +1,5 @@
 """
+backend/app/services/image_captioner.py
 TokenFlow Image Captioner
 
 Provides lazy-loaded image description for photographs and
@@ -75,7 +76,7 @@ class PhotoCaptioner:
             return
 
         try:
-            import timm.layers  # noqa: F401
+            import timm.layers  # type: ignore[import-not-found]
 
             # Real timm.layers exists (timm was upgraded) --
             # nothing to shim.
