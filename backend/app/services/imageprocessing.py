@@ -239,7 +239,9 @@ class ImageProcessor:
 
             text, confidence = (
                 self._safe_printed_ocr(
-                    image
+                    image,
+                    allow_preprocessed=False,
+                    allow_full_resolution_retry=False,
                 )
             )
 
@@ -318,7 +320,9 @@ class ImageProcessor:
 
         text, confidence = (
             self._safe_printed_ocr(
-                image
+                image,
+                allow_preprocessed=True,
+                allow_full_resolution_retry=True,
             )
         )
 
@@ -478,7 +482,9 @@ class ImageProcessor:
 
         printed_text, printed_conf = (
             self._safe_printed_ocr(
-                image
+                image,
+                allow_preprocessed=True,
+                allow_full_resolution_retry=True,
             )
         )
 
@@ -736,6 +742,8 @@ class ImageProcessor:
     def _safe_printed_ocr(
         self,
         image: Image.Image,
+        allow_preprocessed: bool = False,
+        allow_full_resolution_retry: bool = False,
     ) -> Tuple[str, float]:
 
         try:
@@ -746,27 +754,63 @@ class ImageProcessor:
 
             return "", 0.0
 
-        variants = [
-            image,
-            self._preprocess_for_printed(
-                image
-            ),
-        ]
+        # ----------------------------------------------------
+        # FIRST PASS
+        #
+        # Always start with the original image.
+        # ----------------------------------------------------
+
+        variants = [image]
+
+        # ----------------------------------------------------
+        # OPTIONAL SECOND PASS
+        #
+        # Only document-like inputs should get the
+        # preprocessing pass.
+        #
+        # Photos/artwork skip it completely.
+        # ----------------------------------------------------
+
+        if allow_preprocessed:
+
+            variants.append(
+                self._preprocess_for_printed(
+                    image
+                )
+            )
 
         best_text = ""
         best_confidence = 0.0
 
-        for candidate in variants:
+        for index, candidate in enumerate(
+            variants,
+            start=1,
+        ):
 
             try:
 
+                print(
+                    f"[OCR] Printed OCR pass "
+                    f"{index}/{len(variants)}",
+                    flush=True,
+                )
+
                 text = (
                     self._printed.recognize(
-                        candidate
+                        candidate,
+                        allow_full_resolution_retry=(
+                            allow_full_resolution_retry
+                        ),
                     )
                 )
 
-            except Exception:
+            except Exception as exc:
+
+                print(
+                    f"[OCR] Printed OCR pass "
+                    f"{index} failed: {exc}",
+                    flush=True,
+                )
 
                 continue
 
@@ -788,6 +832,10 @@ class ImageProcessor:
 
                 best_text = text
                 best_confidence = confidence
+
+            # ------------------------------------------------
+            # Stop immediately once reliable text is found.
+            # ------------------------------------------------
 
             if self._is_reliable(
                 text,
@@ -857,39 +905,37 @@ class ImageProcessor:
     # CAPTIONING
     # ========================================================
 
-    def _safe_caption(
-        self,
-        image: Image.Image,
-    ) -> str:
+    def _safe_caption(self, image: Image.Image) -> str:
+        import time
 
         try:
+            print("[PHOTO] Captioning started...", flush=True)
+
+            start = time.perf_counter()
 
             self._ensure_captioner()
 
-            description = (
-                self._photo_captioner
-                .describe(image)
+            description = self._photo_captioner.describe(image)
+
+            elapsed = time.perf_counter() - start
+
+            print(
+                f"[PHOTO] Captioning completed in {elapsed:.2f}s",
+                flush=True,
             )
 
-            description = (
-                self._clean_text(
-                    description
-                )
+            description = self._clean_text(description)
+
+            print(
+                f"[PHOTO] Caption result: {description[:200]}",
+                flush=True,
             )
 
-            if (
-                len(description.strip())
-                >= self.MIN_USEFUL_CHARS
-            ):
-
+            if len(description.strip()) >= self.MIN_USEFUL_CHARS:
                 return description
 
         except Exception as exc:
-
-            print(
-                f"[PHOTO] Captioning unavailable: "
-                f"{exc}"
-            )
+            print(f"[PHOTO] Captioning unavailable: {exc}", flush=True)
 
         return ""
 

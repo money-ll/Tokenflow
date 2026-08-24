@@ -39,7 +39,7 @@ class PrintedTextRecognizer:
     # Some source pages (large scans/posters, high-DPI renders)
     # are far bigger than a normal 1275x1650 page. Resizing to
     # this ceiling still keeps performance reasonable.
-    MAX_DIMENSION = 1800
+    MAX_DIMENSION = 1600
 
     # EasyOCR's internal detection canvas.
     #
@@ -354,6 +354,7 @@ class PrintedTextRecognizer:
     def recognize(
         self,
         image: Image.Image,
+        allow_full_resolution_retry: bool = False,
     ):
 
         print(
@@ -602,49 +603,59 @@ class PrintedTextRecognizer:
                 )
 
         # ----------------------------------------------------
-        # Zero-detection fallback.
+        # Optional high-resolution retry.
         #
-        # If nothing was detected on the (possibly downscaled)
-        # image, retry once directly against the full-resolution
-        # original array with a matching canvas size. This
-        # recovers pages with small/dense text that got lost to
-        # resizing, without paying the cost on every normal page.
+        # IMPORTANT:
+        # Normal images/photos do NOT use this retry.
+        # It is only enabled by callers that explicitly know
+        # they are processing a document where tiny text matters.
+        #
+        # The old implementation could spend 15-20+ seconds
+        # retrying a large image just to recover 1-2 characters.
         # ----------------------------------------------------
 
         retry_time = 0.0
 
-        if not lines and resized:
+        if (
+            not lines
+            and resized
+            and allow_full_resolution_retry
+        ):
 
             retry_start = time.perf_counter()
 
             print(
                 "[OCR] 0 blocks detected on resized "
-                "image - retrying at full resolution"
+                "image - document retry enabled"
             )
 
-            retry_canvas = min(
-                max(original_height, original_width),
-                2600,
-            )
+            # Do NOT return to the original 5813x4300 size.
+            # Use a moderate second-pass canvas instead.
+            #
+            # First pass: 1600px
+            # Retry:     1800px
+            #
+            # This is much cheaper than the old 2600px retry.
+            retry_canvas = 1800
 
             retry_results = self._reader.readtext(
                 array,
                 detail=0,
                 paragraph=False,
+
                 text_threshold=self.TEXT_THRESHOLD,
                 low_text=self.LOW_TEXT,
                 link_threshold=self.LINK_THRESHOLD,
+
                 canvas_size=retry_canvas,
                 mag_ratio=self.OCR_MAG_RATIO,
+
                 contrast_ths=self.CONTRAST_THRESHOLD,
                 adjust_contrast=self.ADJUST_CONTRAST,
+
                 width_ths=self.WIDTH_THRESHOLD,
                 ycenter_ths=self.YCENTER_THRESHOLD,
-                # This retry runs at near-full resolution, so the
-                # detector proposes far more candidate regions than
-                # the normal downscaled pass. Without batching, each
-                # one pays full recognizer overhead sequentially --
-                # this is what caused the 15-20s spikes.
+
                 batch_size=self.RECOGNITION_BATCH_SIZE,
                 workers=0,
             )
@@ -659,15 +670,20 @@ class PrintedTextRecognizer:
                 if not cleaned:
                     continue
 
-                cleaned = " ".join(cleaned.split())
+                cleaned = " ".join(
+                    cleaned.split()
+                )
 
                 if cleaned:
                     lines.append(cleaned)
 
-            retry_time = time.perf_counter() - retry_start
+            retry_time = (
+                time.perf_counter()
+                - retry_start
+            )
 
             print(
-                f"[OCR] Full-resolution retry: "
+                f"[OCR] Document retry: "
                 f"{len(lines)} block(s) recovered "
                 f"({retry_time:.3f}s)"
             )
