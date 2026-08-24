@@ -33,3 +33,6 @@ scikit-image==0.25.2
 scipy==1.16.1
 # Math OCR (lazy-loaded only when an equation is detected)
 pix2tex>=0.0.30
+
+#Evaluation Metrics
+bert-score>=0.3.13

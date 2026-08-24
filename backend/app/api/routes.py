@@ -15,6 +15,7 @@ async def optimize(
     file: UploadFile = File(...),
     query: str = Form(""),
     target_reduction: float = Form(0.45),
+    evaluate: bool = Form(False),
 ):
     if not file.filename:
         raise HTTPException(400, "A file is required.")
@@ -28,6 +29,7 @@ async def optimize(
             content=content,
             query=query,
             target_reduction=target_reduction,
+            evaluate=evaluate,
         )
         history_store.add(result)
         return result

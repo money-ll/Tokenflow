@@ -11,6 +11,7 @@ class HistoryStore:
             "filename": result.get("filename"),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "metrics": result.get("metrics", {}),
+            "evaluation": result.get("evaluation"),
         }
         self._items.appendleft(item)
 

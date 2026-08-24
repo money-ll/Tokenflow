@@ -1,10 +1,11 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api/v1";
 
-export async function optimizeFile(file, query = "", targetReduction = 0.45) {
+export async function optimizeFile(file, query = "", targetReduction = 0.45, evaluate = false) {
   const form = new FormData();
   form.append("file", file);
   form.append("query", query);
   form.append("target_reduction", String(targetReduction));
+  form.append("evaluate", String(evaluate));
 
   const response = await fetch(`${API_BASE}/optimize`, {
     method: "POST",

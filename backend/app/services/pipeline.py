@@ -6,6 +6,7 @@ from app.services.extractor import InputExtractor
 from app.services.optimizer import SemanticOptimizer
 from app.services.tokenizer import TokenCounter
 from app.services.section_selector import SectionSelector
+from app.services.evaluator import evaluator
 
 
 class TokenFlowPipeline:
@@ -40,7 +41,7 @@ class TokenFlowPipeline:
         self.counter = TokenCounter()
         self.section_selector = SectionSelector()
 
-    def process(self, filename, content, query="", target_reduction=0.45):
+    def process(self, filename, content, query="", target_reduction=0.45, evaluate=False):
         raw_text, source_meta = self.extractor.extract(filename, content)
 
         # If the query is asking to be restricted to one section (e.g.
@@ -100,6 +101,14 @@ class TokenFlowPipeline:
         optimized_tokens = self.counter.count(assembled)
         reduction = self.counter.reduction_rate(raw_tokens, optimized_tokens)
 
+        # BERTScore is relatively slow (loads a transformer model on first
+        # call), so it only runs when the caller explicitly asks for it.
+        evaluation = None
+        if evaluate:
+            evaluation = evaluator.evaluate_optimization(
+                working_text, context, reduction
+            )
+
         digest = hashlib.sha1(
             (filename + str(datetime.now(timezone.utc).timestamp())).encode()
         ).hexdigest()[:12]
@@ -119,6 +128,7 @@ class TokenFlowPipeline:
             "section": section_info,
             "optimized_text": context,
             "assembled_prompt": assembled,
+            "evaluation": evaluation,
             "metrics": {
                 "original_tokens": raw_tokens,
                 "optimized_tokens": optimized_tokens,
