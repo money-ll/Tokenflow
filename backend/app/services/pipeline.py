@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from app.services.extractor import InputExtractor
 from app.services.optimizer import SemanticOptimizer
 from app.services.tokenizer import TokenCounter
+from app.services.section_selector import SectionSelector
 
 
 class TokenFlowPipeline:
@@ -37,19 +38,37 @@ class TokenFlowPipeline:
         self.extractor = InputExtractor()
         self.optimizer = SemanticOptimizer()
         self.counter = TokenCounter()
+        self.section_selector = SectionSelector()
 
     def process(self, filename, content, query="", target_reduction=0.45):
         raw_text, source_meta = self.extractor.extract(filename, content)
-        raw_tokens = self.counter.count(raw_text)
 
-        text_for_compression = raw_text
+        # If the query is asking to be restricted to one section (e.g.
+        # "only give me the introduction, summarized"), slice the
+        # document down to that section BEFORE compression, so both the
+        # token counts and the optimized output reflect just that
+        # section rather than the whole document.
+        working_text = raw_text
+        section_info = None
+        requested_section = self.section_selector.detect_requested_section(query)
+        if requested_section:
+            section_text = self.section_selector.extract_section(raw_text, requested_section)
+            if section_text:
+                working_text = section_text
+                section_info = {"requested": requested_section, "found": True}
+            else:
+                section_info = {"requested": requested_section, "found": False}
+
+        raw_tokens = self.counter.count(working_text)
+
+        text_for_compression = working_text
         protected_blocks = []
 
         if source_meta.get("math_extraction_used") or source_meta.get(
             "diagram_extraction_used"
         ):
             text_for_compression, protected_blocks = (
-                self._inline_protected_blocks(raw_text)
+                self._inline_protected_blocks(working_text)
             )
 
         optimized = self.optimizer.optimize(
@@ -97,6 +116,7 @@ class TokenFlowPipeline:
             "id": digest,
             "filename": filename,
             "source": source_meta,
+            "section": section_info,
             "optimized_text": context,
             "assembled_prompt": assembled,
             "metrics": {
